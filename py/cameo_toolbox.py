@@ -1196,6 +1196,8 @@ def create_mask_weigth(data, lon_initial, lon_final, lat_initial, lat_final):
     dlat = np.abs(np.diff(data.lat.data)).mean()
     dlon = np.abs(np.diff(data.lon.data)).mean()
 
+    lat_initial, lat_final = sorted((lat_initial, lat_final))
+
     if lon_initial > lon_final:
         mask_lon = data_ones.where((data.lon >= lon_initial) | (data.lon <= lon_final), 0)
     else:
@@ -1251,6 +1253,8 @@ def create_mask(data, lon_initial, lon_final, lat_initial, lat_final):
     """Create a binary 0/1 lat/lon box mask (cell-center based)."""
     data_ones = xr.ones_like(data)
 
+    lat_initial, lat_final = sorted((lat_initial, lat_final))
+
     if lon_initial > lon_final:
         mask_lon = data_ones.where((data.lon >= lon_initial) | (data.lon <= lon_final), 0)
     else:
@@ -1273,6 +1277,7 @@ def _normalize_lat_range(lat_range):
     if lat_range is None:
         return None
     lat_min, lat_max = lat_range
+    lat_min, lat_max = sorted((float(lat_min), float(lat_max)))
     return float(lat_min), float(lat_max)
 
 
@@ -1326,6 +1331,9 @@ def land_mask_from_cartopy(template, resolution='110m'):
     Returns 1 for land and 0 for ocean on the template lat/lon grid.  The
     template may use either 0--360 or -180--180 longitude; the polygons are
     tested in the -180--180 frame and mapped back to the original grid.
+
+    Inland waters (lakes/reservoirs) are excluded from the land mask so that
+    ocean masks do not falsely include lake-covered cells.
     """
     import cartopy.feature as cfeature
     from shapely.vectorized import contains
@@ -1337,19 +1345,49 @@ def land_mask_from_cartopy(template, resolution='110m'):
     lon_wrapped = (lon + 180.0) % 360.0 - 180.0
     lon2d, lat2d = np.meshgrid(lon_wrapped, lat)
 
-    land = cfeature.NaturalEarthFeature('physical', 'land', resolution)
-    geoms = list(land.geometries())
-    if not geoms:
-        raise ValueError(f"No land geometries loaded from Natural Earth '{resolution}'.")
+    def _feature_mask(feature_name):
+        feat = cfeature.NaturalEarthFeature('physical', feature_name, resolution)
+        geoms = list(feat.geometries())
+        if not geoms:
+            return np.zeros_like(lon2d, dtype=float)
+        union = unary_union(geoms)
+        return contains(union, lon2d, lat2d).astype(float)
 
-    union = unary_union(geoms)
-    mask = contains(union, lon2d, lat2d).astype(float)
+    land_mask = _feature_mask('land')
+    lake_mask = _feature_mask('lakes')
+    mask = np.logical_and(land_mask.astype(bool), ~lake_mask.astype(bool)).astype(float)
 
     return xr.DataArray(
         mask,
         dims=('lat', 'lon'),
         coords={'lat': lat, 'lon': lon},
         name='land_mask',
+    )
+
+
+def inland_water_mask_from_cartopy(template, resolution='110m'):
+    """Return 1 where inland water polygons (lakes/reservoirs) exist."""
+    import cartopy.feature as cfeature
+    from shapely.vectorized import contains
+    from shapely.ops import unary_union
+
+    lat = np.asarray(template.lat.values)
+    lon = np.asarray(template.lon.values)
+    lon_wrapped = (lon + 180.0) % 360.0 - 180.0
+    lon2d, lat2d = np.meshgrid(lon_wrapped, lat)
+
+    lake = cfeature.NaturalEarthFeature('physical', 'lakes', resolution)
+    geoms = list(lake.geometries())
+    if not geoms:
+        return xr.zeros_like(template, dtype=float)
+
+    union = unary_union(geoms)
+    mask = contains(union, lon2d, lat2d).astype(float)
+    return xr.DataArray(
+        mask,
+        dims=('lat', 'lon'),
+        coords={'lat': lat, 'lon': lon},
+        name='inland_water_mask',
     )
 
 
@@ -1437,9 +1475,25 @@ def _land_sea_mask(template, surface_type, land_mask=None, land_mask_path=None):
 
     lsm = (lsm >= 0.5).astype(float)
 
+    try:
+        lake_mask = inland_water_mask_from_cartopy(template)
+        if 'time' in lake_mask.dims:
+            lake_mask = lake_mask.isel(time=0, drop=True)
+        for coord in list(lake_mask.coords):
+            if coord not in ('lat', 'lon'):
+                lake_mask = lake_mask.drop_vars(coord, errors='ignore')
+        if 'lat' in lake_mask.dims and 'lon' in lake_mask.dims:
+            if not np.array_equal(lake_mask.lat.values, template.lat.values) or not np.array_equal(lake_mask.lon.values, template.lon.values):
+                lake_mask = lake_mask.interp(lat=template.lat, lon=template.lon, method='nearest')
+        lake_mask = (lake_mask >= 0.5).astype(float)
+    except Exception:
+        lake_mask = xr.zeros_like(template, dtype=float)
+
+    lsm = lsm * (1.0 - lake_mask)
+
     if surface_type == 'land':
         return lsm
-    return 1.0 - lsm
+    return (1.0 - lsm) * (1.0 - lake_mask)
 
 
 def _spatial_weights(da, mask, edge_weighted=False):
